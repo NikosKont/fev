@@ -3,21 +3,23 @@ import datasets
 import fev
 
 
-class ChronosModel(fev.ForecastingModel):
-    """Chronos-Bolt model from https://github.com/amazon-science/chronos-forecasting."""
+class Chronos2Model(fev.ForecastingModel):
+    """Chronos-2 model from https://github.com/amazon-science/chronos-forecasting."""
 
-    model_name = "chronos"
+    model_name = "chronos-2"
 
     def __init__(
         self,
-        model_path: str = "amazon/chronos-bolt-base",
+        model_path: str = "amazon/chronos-2",
         device: str = "cuda",
-        batch_size: int = 256,
+        batch_size: int = 100,
+        cross_learning: bool = True,
     ):
         super().__init__()
         self.model_path = model_path
         self.device = device
         self.batch_size = batch_size
+        self.cross_learning = cross_learning
 
     def _fit_predict(self, task: fev.Task) -> list[datasets.DatasetDict]:
         import torch
@@ -30,6 +32,8 @@ class ChronosModel(fev.ForecastingModel):
             self.model_path, device_map=self.device, torch_dtype=torch.float32
         )
 
-        predictions_per_window, self.inference_time = pipeline.predict_fev(task, batch_size=self.batch_size)
+        predictions_per_window, self.inference_time = pipeline.predict_fev(
+            task, batch_size=self.batch_size, cross_learning=self.cross_learning
+        )
 
         return predictions_per_window
