@@ -75,6 +75,13 @@ def _reference_seasonal_error_per_item(arrays, seasonality, aggregate_fn):
     return np.array(result, dtype="float64")
 
 
+def _arrays_to_flat(arrays):
+    """Helper to convert list of 1D arrays to flat [total_T, 1] + lengths [N]."""
+    lengths = np.array([len(a) for a in arrays], dtype=np.int64)
+    flat = np.concatenate(arrays).astype(np.float64).reshape(-1, 1) if arrays else np.empty((0, 1), dtype=np.float64)
+    return flat, lengths
+
+
 @pytest.mark.parametrize("aggregate_fn", [np.abs, np.square])
 def test_seasonal_error_per_item(aggregate_fn):
     """Test vectorized impl against reference with mixed edge cases."""
@@ -88,7 +95,10 @@ def test_seasonal_error_per_item(aggregate_fn):
     ]
     seasonality = 2
 
-    result = _seasonal_error_per_item(arrays, seasonality, aggregate_fn)
+    flat, lengths = _arrays_to_flat(arrays)
+    result = _seasonal_error_per_item(
+        y_past=flat, y_past_lengths=lengths, seasonality=seasonality, aggregate_fn=aggregate_fn
+    )[:, 0]
     expected = _reference_seasonal_error_per_item(arrays, seasonality, aggregate_fn)
 
     np.testing.assert_allclose(result, expected)
@@ -96,6 +106,7 @@ def test_seasonal_error_per_item(aggregate_fn):
 
 def test_seasonal_error_per_item_empty():
     """Test with empty input."""
-    result = _seasonal_error_per_item([], 2, np.abs)
-    assert len(result) == 0
+    flat, lengths = _arrays_to_flat([])
+    result = _seasonal_error_per_item(y_past=flat, y_past_lengths=lengths, seasonality=2, aggregate_fn=np.abs)
+    assert result.size == 0
     assert result.dtype == np.float64

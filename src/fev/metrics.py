@@ -1,9 +1,6 @@
 from typing import Any, Callable, Type
 
-import datasets
 import numpy as np
-
-from fev.constants import PREDICTIONS
 
 MetricConfig = str | dict[str, Any]
 
@@ -19,25 +16,43 @@ class Metric:
         return self.__class__.__name__
 
     @staticmethod
-    def _safemean(arr: np.ndarray) -> float:
-        """Compute mean of an array, ignoring NaN, Inf, and -Inf values."""
-        return float(np.mean(arr[np.isfinite(arr)]))
-
-    @staticmethod
-    def _get_y_test(test_data: datasets.Dataset, target_column: str) -> np.ndarray:
-        """ "Return array of shape [len(test_data), horizon] with ground truth values in float64 dtype."""
-        return np.array(test_data[target_column], dtype=np.float64)
+    def _safemean(arr: np.ndarray, axis=None) -> float | np.ndarray:
+        """Compute mean ignoring NaN, Inf, and -Inf values."""
+        mask = ~np.isfinite(arr)
+        if mask.any():
+            arr = np.where(mask, np.nan, arr)
+        return np.nanmean(arr, axis=axis)
 
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
     ) -> float:
+        """Compute the metric score. Computed per target dim, then averaged across dims.
+
+        Parameters
+        ----------
+        y_true : np.ndarray [N, H, D]
+            Ground truth. N=number of time series, H=forecast horizon, D=target dimensions.
+        y_pred : np.ndarray [N, H, D]
+            Point forecast predictions, same shape as y_true.
+        y_past : np.ndarray [total_T, D]
+            Concatenated historical observations for all items (ragged time axis).
+        y_past_lengths : np.ndarray [N]
+            Number of past observations per item. sum(y_past_lengths) == total_T.
+        q_pred : np.ndarray [N, H, D, Q]
+            Quantile predictions. Q=len(quantile_levels), or Q=0 if none requested.
+        seasonality : int
+            Seasonal period for scaled error metrics (MASE, RMSSE, SQL).
+        quantile_levels : list[float]
+            Quantile levels in (0, 1) corresponding to q_pred's last axis.
+        """
         raise NotImplementedError
 
 
@@ -65,16 +80,16 @@ class MAE(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        y_test = self._get_y_test(test_data, target_column=target_column)
-        y_pred = np.array(predictions[PREDICTIONS])
-        return np.nanmean(np.abs(y_test - y_pred))
+    ) -> float:
+        per_dim = np.nanmean(np.abs(y_true - y_pred), axis=(0, 1))  # [D]
+        return float(np.mean(per_dim))
 
 
 class WAPE(Metric):
@@ -86,17 +101,18 @@ class WAPE(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        y_test = self._get_y_test(test_data, target_column=target_column)
-        y_pred = np.array(predictions[PREDICTIONS])
-
-        return np.nanmean(np.abs(y_test - y_pred)) / max(self.epsilon, np.nanmean(np.abs(y_test)))
+    ) -> float:
+        abs_err_per_dim = np.nanmean(np.abs(y_true - y_pred), axis=(0, 1))  # [D]
+        abs_true_per_dim = np.nanmean(np.abs(y_true), axis=(0, 1))  # [D]
+        per_dim = abs_err_per_dim / np.maximum(abs_true_per_dim, self.epsilon)
+        return float(np.mean(per_dim))
 
 
 class MASE(Metric):
@@ -113,21 +129,20 @@ class MASE(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        y_test = self._get_y_test(test_data, target_column=target_column)
-        y_pred = np.array(predictions[PREDICTIONS])
-
+    ) -> float:
         seasonal_error = _abs_seasonal_error_per_item(
-            past_data=past_data, seasonality=seasonality, target_column=target_column
-        )
+            y_past=y_past, y_past_lengths=y_past_lengths, seasonality=seasonality
+        )  # [N, D]
         seasonal_error = np.clip(seasonal_error, self.epsilon, None)
-        return self._safemean(np.abs(y_test - y_pred) / seasonal_error[:, None])
+        scaled = np.abs(y_true - y_pred) / seasonal_error[:, None, :]  # [N, H, D]
+        return float(np.mean(self._safemean(scaled, axis=(0, 1))))
 
 
 class RMSE(Metric):
@@ -136,16 +151,16 @@ class RMSE(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        y_test = self._get_y_test(test_data, target_column=target_column)
-        y_pred = np.array(predictions[PREDICTIONS])
-        return np.sqrt(np.nanmean((y_test - y_pred) ** 2))
+    ) -> float:
+        per_dim = np.sqrt(np.nanmean((y_true - y_pred) ** 2, axis=(0, 1)))  # [D]
+        return float(np.mean(per_dim))
 
 
 class RMSSE(Metric):
@@ -162,20 +177,20 @@ class RMSSE(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        y_test = self._get_y_test(test_data, target_column=target_column)
-        y_pred = np.array(predictions[PREDICTIONS])
+    ) -> float:
         seasonal_error = _squared_seasonal_error_per_item(
-            past_data, seasonality=seasonality, target_column=target_column
-        )
+            y_past=y_past, y_past_lengths=y_past_lengths, seasonality=seasonality
+        )  # [N, D]
         seasonal_error = np.clip(seasonal_error, self.epsilon, None)
-        return np.sqrt(self._safemean((y_test - y_pred) ** 2 / seasonal_error[:, None]))
+        scaled = (y_true - y_pred) ** 2 / seasonal_error[:, None, :]  # [N, H, D]
+        return float(np.mean(np.sqrt(self._safemean(scaled, axis=(0, 1)))))
 
 
 class MSE(Metric):
@@ -184,16 +199,16 @@ class MSE(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        y_test = self._get_y_test(test_data, target_column=target_column)
-        y_pred = np.array(predictions[PREDICTIONS])
-        return np.nanmean((y_test - y_pred) ** 2)
+    ) -> float:
+        per_dim = np.nanmean((y_true - y_pred) ** 2, axis=(0, 1))  # [D]
+        return float(np.mean(per_dim))
 
 
 class RMSLE(Metric):
@@ -202,16 +217,16 @@ class RMSLE(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        y_test = self._get_y_test(test_data, target_column=target_column)
-        y_pred = np.array(predictions[PREDICTIONS])
-        return np.sqrt(np.nanmean((np.log1p(y_test) - np.log1p(y_pred)) ** 2))
+    ) -> float:
+        per_dim = np.sqrt(np.nanmean((np.log1p(y_true) - np.log1p(y_pred)) ** 2, axis=(0, 1)))  # [D]
+        return float(np.mean(per_dim))
 
 
 class MAPE(Metric):
@@ -220,17 +235,16 @@ class MAPE(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        y_test = self._get_y_test(test_data, target_column=target_column)
-        y_pred = np.array(predictions[PREDICTIONS])
-        ratio = np.abs(y_test - y_pred) / np.abs(y_test)
-        return self._safemean(ratio)
+    ) -> float:
+        ratio = np.abs(y_true - y_pred) / np.abs(y_true)  # [N, H, D]
+        return float(np.mean(self._safemean(ratio, axis=(0, 1))))
 
 
 class SMAPE(Metric):
@@ -239,16 +253,16 @@ class SMAPE(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        y_test = self._get_y_test(test_data, target_column=target_column)
-        y_pred = np.array(predictions[PREDICTIONS])
-        return self._safemean(2 * np.abs(y_test - y_pred) / (np.abs(y_test) + np.abs(y_pred)))
+    ) -> float:
+        val = 2 * np.abs(y_true - y_pred) / (np.abs(y_true) + np.abs(y_pred))  # [N, H, D]
+        return float(np.mean(self._safemean(val, axis=(0, 1))))
 
 
 class MQL(Metric):
@@ -259,22 +273,19 @@ class MQL(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        if quantile_levels is None or len(quantile_levels) == 0:
-            raise ValueError(f"{self.__class__.__name__} cannot be computed if quantile_levels is None")
-        ql = _quantile_loss(
-            test_data=test_data,
-            predictions=predictions,
-            quantile_levels=quantile_levels,
-            target_column=target_column,
-        )
-        return np.nanmean(ql)
+    ) -> float:
+        if len(quantile_levels) == 0:
+            raise ValueError(f"{self.__class__.__name__} cannot be computed without quantile_levels")
+        ql = _quantile_loss(y_true=y_true, q_pred=q_pred, quantile_levels=quantile_levels)  # [N, H, D, Q]
+        per_dim = np.nanmean(ql, axis=(0, 1, 3))  # [D]
+        return float(np.mean(per_dim))
 
 
 class SQL(Metric):
@@ -293,25 +304,22 @@ class SQL(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        ql = _quantile_loss(
-            test_data=test_data,
-            predictions=predictions,
-            quantile_levels=quantile_levels,
-            target_column=target_column,
-        )
-        ql_per_time_step = np.nanmean(ql, axis=2)  # [num_items, horizon]
+    ) -> float:
+        ql = _quantile_loss(y_true=y_true, q_pred=q_pred, quantile_levels=quantile_levels)  # [N, H, D, Q]
+        ql_avg_q = np.nanmean(ql, axis=3)  # [N, H, D]
         seasonal_error = _abs_seasonal_error_per_item(
-            past_data=past_data, seasonality=seasonality, target_column=target_column
-        )
+            y_past=y_past, y_past_lengths=y_past_lengths, seasonality=seasonality
+        )  # [N, D]
         seasonal_error = np.clip(seasonal_error, self.epsilon, None)
-        return self._safemean(ql_per_time_step / seasonal_error[:, None])
+        scaled = ql_avg_q / seasonal_error[:, None, :]  # [N, H, D]
+        return float(np.mean(self._safemean(scaled, axis=(0, 1))))
 
 
 class WQL(Metric):
@@ -325,94 +333,120 @@ class WQL(Metric):
     def compute(
         self,
         *,
-        test_data: datasets.Dataset,
-        predictions: datasets.Dataset,
-        past_data: datasets.Dataset,
+        y_true: np.ndarray,
+        y_pred: np.ndarray,
+        y_past: np.ndarray,
+        y_past_lengths: np.ndarray,
+        q_pred: np.ndarray,
         seasonality: int,
         quantile_levels: list[float],
-        target_column: str = "target",
-    ):
-        ql = _quantile_loss(
-            test_data=test_data,
-            predictions=predictions,
-            quantile_levels=quantile_levels,
-            target_column=target_column,
-        )
-        return np.nanmean(ql) / max(self.epsilon, np.nanmean(np.abs(np.array(test_data[target_column]))))
+    ) -> float:
+        ql = _quantile_loss(y_true=y_true, q_pred=q_pred, quantile_levels=quantile_levels)  # [N, H, D, Q]
+        ql_per_dim = np.nanmean(ql, axis=(0, 1, 3))  # [D]
+        abs_true_per_dim = np.nanmean(np.abs(y_true), axis=(0, 1))  # [D]
+        per_dim = ql_per_dim / np.maximum(abs_true_per_dim, self.epsilon)
+        return float(np.mean(per_dim))
 
 
 def _quantile_loss(
     *,
-    test_data: datasets.Dataset,
-    predictions: datasets.Dataset,
+    y_true: np.ndarray,
+    q_pred: np.ndarray,
     quantile_levels: list[float],
-    target_column: str,
-):
-    """Compute quantile loss for each observation"""
-    pred_per_quantile = []
-    for q in quantile_levels:
-        pred_per_quantile.append(np.array(predictions[str(q)]))
-    q_pred = np.stack(pred_per_quantile, axis=-1)  # [num_series, horizon, len(quantile_levels)]
-    y_test = Metric._get_y_test(test_data, target_column=target_column)[..., None]  # [num_series, horizon, 1]
-    assert y_test.shape[:-1] == q_pred.shape[:-1]
-    return 2 * np.abs((y_test - q_pred) * ((y_test <= q_pred) - np.array(quantile_levels)))
+) -> np.ndarray:
+    """Compute quantile loss.
+
+    Returns
+    -------
+    np.ndarray [N, H, D, Q]
+    """
+    y_true_expanded = y_true[..., None]  # [N, H, D, 1]
+    q_arr = np.array(quantile_levels)  # [Q]
+    return 2 * np.abs((y_true_expanded - q_pred) * ((y_true_expanded <= q_pred) - q_arr))
 
 
 def _seasonal_error_per_item(
-    arrays: list[np.ndarray],
+    *,
+    y_past: np.ndarray,
+    y_past_lengths: np.ndarray,
     seasonality: int,
     aggregate_fn: Callable,
 ) -> np.ndarray:
-    """Compute seasonal error for each time series using vectorized operations.
+    """Compute seasonal error for each (item, dim) pair.
 
-    Uses bincount with weights to efficiently compute per-series aggregations.
+    Parameters
+    ----------
+    y_past : np.ndarray [total_T, D]
+        Concatenated past observations.
+    y_past_lengths : np.ndarray [N]
+        Number of observations per item.
+    seasonality : int
+        Seasonal period.
+    aggregate_fn : Callable
+        Applied element-wise to seasonal diffs (e.g. np.abs or np.square).
+
+    Returns
+    -------
+    np.ndarray [N, D]
     """
-    num_series = len(arrays)
-    if num_series == 0:
-        return np.array([], dtype="float64")
+    num_series = len(y_past_lengths)
+    num_dims = y_past.shape[1]
 
-    lengths = np.array([a.size for a in arrays], dtype=np.int64)
-    num_diffs_per_series = np.maximum(lengths - seasonality, 0)
+    if num_series == 0:
+        return np.array([], dtype="float64").reshape(0, 0)
+
+    num_diffs_per_series = np.maximum(y_past_lengths - seasonality, 0)
 
     if num_diffs_per_series.sum() == 0:
-        return np.full(num_series, np.nan, dtype="float64")
+        return np.full((num_series, num_dims), np.nan, dtype="float64")
 
-    flat = np.concatenate(arrays).astype("float64")
-    series_starts = np.concatenate([[0], np.cumsum(lengths[:-1])])
+    # Fast path: all items have equal length — reshape + slice instead of fancy indexing
+    if np.all(y_past_lengths == y_past_lengths[0]):
+        T = int(y_past_lengths[0])
+        y_reshaped = y_past.reshape(num_series, T, num_dims)
+        diffs = y_reshaped[:, seasonality:, :] - y_reshaped[:, :-seasonality, :]
+        return np.nanmean(aggregate_fn(diffs), axis=1)
 
-    # Build indices for all (t, t-seasonality) pairs across all series
     total_diffs = int(num_diffs_per_series.sum())
     series_ids = np.repeat(np.arange(num_series, dtype=np.int64), num_diffs_per_series)
     diff_offsets = np.arange(total_diffs) - np.repeat(
         np.cumsum(num_diffs_per_series) - num_diffs_per_series, num_diffs_per_series
     )
 
-    idx_current = series_starts[series_ids] + seasonality + diff_offsets
+    offsets = np.empty(num_series + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(y_past_lengths, out=offsets[1:])
+    idx_current = offsets[series_ids] + seasonality + diff_offsets
     idx_lagged = idx_current - seasonality
 
-    diffs = flat[idx_current] - flat[idx_lagged]
-    errors = aggregate_fn(diffs)
+    diffs = y_past[idx_current] - y_past[idx_lagged]  # [total_diffs, D]
+    errors = aggregate_fn(diffs)  # [total_diffs, D]
 
-    # Compute per-series nanmean via bincount
-    valid = ~np.isnan(errors)
-    sums = np.bincount(series_ids, weights=np.where(valid, errors, 0.0), minlength=num_series)
-    counts = np.bincount(series_ids, weights=valid.astype("float64"), minlength=num_series)
+    valid = ~np.isnan(errors)  # [total_diffs, D]
+    result = np.full((num_series, num_dims), np.nan, dtype="float64")
+    for d in range(num_dims):
+        sums = np.bincount(series_ids, weights=np.where(valid[:, d], errors[:, d], 0.0), minlength=num_series)
+        counts = np.bincount(series_ids, weights=valid[:, d].astype("float64"), minlength=num_series)
+        mask = counts > 0
+        result[mask, d] = sums[mask] / counts[mask]
 
-    result = np.full(num_series, np.nan, dtype="float64")
-    np.divide(sums, counts, out=result, where=counts > 0)
     return result
 
 
-def _abs_seasonal_error_per_item(past_data: datasets.Dataset, seasonality: int, target_column: str) -> np.ndarray:
-    """Compute mean absolute seasonal error for each time series in past_data."""
-    arrays = past_data.with_format("numpy")[target_column]
-    return _seasonal_error_per_item(arrays, seasonality, aggregate_fn=np.abs)
+def _abs_seasonal_error_per_item(*, y_past: np.ndarray, y_past_lengths: np.ndarray, seasonality: int) -> np.ndarray:
+    """Compute mean absolute seasonal error. Returns [N, D]."""
+    return _seasonal_error_per_item(
+        y_past=y_past, y_past_lengths=y_past_lengths, seasonality=seasonality, aggregate_fn=np.abs
+    )
 
 
-def _squared_seasonal_error_per_item(past_data: datasets.Dataset, seasonality: int, target_column: str) -> np.ndarray:
-    """Compute mean squared seasonal error for each time series in past_data."""
-    arrays = past_data.with_format("numpy")[target_column]
-    return _seasonal_error_per_item(arrays, seasonality, aggregate_fn=np.square)
+def _squared_seasonal_error_per_item(
+    *, y_past: np.ndarray, y_past_lengths: np.ndarray, seasonality: int
+) -> np.ndarray:
+    """Compute mean squared seasonal error. Returns [N, D]."""
+    return _seasonal_error_per_item(
+        y_past=y_past, y_past_lengths=y_past_lengths, seasonality=seasonality, aggregate_fn=np.square
+    )
 
 
 AVAILABLE_METRICS: dict[str, Type[Metric]] = {
