@@ -201,7 +201,7 @@ class EvaluationWindow:
         return test_scores
 
 
-@pydantic.dataclasses.dataclass(config={"extra": "forbid"})
+@pydantic.dataclasses.dataclass(config={"extra": "forbid", "arbitrary_types_allowed": True})
 class Task:
     """A univariate or multivariate time series forecasting task.
 
@@ -324,7 +324,8 @@ class Task:
     >>> Task(dataset_path="s3://my-bucket/m4_hourly/*.parquet", ...)
     """
 
-    dataset_path: str
+    dataset_path: str | None = None
+    dataset: datasets.Dataset | None = None
     dataset_config: str | None = None
     # Forecast horizon parameters
     horizon: int = 1
@@ -349,14 +350,26 @@ class Task:
     task_name: str | None = None
 
     def __post_init__(self):
+        assert self.dataset_path is not None or self.dataset is not None, (
+            "Either `dataset_path` or `dataset` must be provided"
+        )
         if self.task_name is None:
             if self.dataset_config is not None:
                 # HF Hub dataset -> name of dataset_config
                 self.task_name = self.dataset_config
-            else:
+            elif self.dataset_path is not None:
                 # File dataset -> names of up to 2 parent directories
                 # e.g. /home/foo/bar/data.parquet -> foo/bar
                 self.task_name = "/".join(Path(self.dataset_path).parts[-3:-1])
+            elif (cfg_name := datasets.DatasetInfo(ds).config_name) is not None:
+                self.task_name = cfg_name
+            elif self.target != "target":
+                if isinstance(self.target, list):
+                    self.task_name = "_".join(self.target)
+                elif isinstance(self.target, str):
+                    self.task_name = self.target
+            else:
+                self.task_name = "new_task"
 
         assert self.num_windows >= 1, "`num_windows` must satisfy >= 1"
         if self.window_step_size is None:
@@ -488,7 +501,7 @@ class Task:
             The preprocessed dataset with all time series.
         """
         if self._full_dataset is None:
-            self._full_dataset = self._load_dataset(storage_options=storage_options, num_proc=num_proc)
+            self._full_dataset = self._load_and_preprocess_dataset(storage_options=storage_options, num_proc=num_proc)
         return self._full_dataset
 
     def iter_windows(
@@ -602,12 +615,7 @@ class Task:
         """List of dynamic covariates available in the task. Does not include the target columns."""
         return self.known_dynamic_columns + self.past_dynamic_columns
 
-    def _load_dataset(
-        self,
-        storage_options: dict | None = None,
-        num_proc: int = DEFAULT_NUM_PROC,
-    ) -> datasets.Dataset:
-        """Load the raw dataset and apply initial preprocessing based on the Task definition."""
+    def _load_dataset(self, storage_options: dict | None = None) -> datasets.Dataset:
         if self.dataset_config is not None:
             # Load dataset from HF Hub
             path = self.dataset_path
@@ -669,6 +677,21 @@ class Task:
                 timestamp_column=self.timestamp_column,
                 static_columns=self.static_columns,
             )
+        return ds
+
+    def _load_and_preprocess_dataset(
+        self,
+        storage_options: dict | None = None,
+        num_proc: int = DEFAULT_NUM_PROC,
+    ) -> datasets.Dataset:
+        """Load the raw dataset and apply initial preprocessing based on the Task definition."""
+
+        if self.dataset is not None:
+            ds = self.dataset
+        else:
+            ds = self._load_dataset(storage_options=storage_options)
+
+        ds = ds.with_format("numpy")
 
         required_columns = self.known_dynamic_columns + self.past_dynamic_columns + self.static_columns
         if self.generate_univariate_targets_from is None:
